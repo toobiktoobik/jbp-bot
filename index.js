@@ -11,10 +11,12 @@ const {
 const express = require('express');
 const cors = require('cors');
 
+// Initialisation d'Express
 const app = express();
 app.use(express.json());
 app.use(cors());
 
+// Initialisation du client Discord avec les intents requis
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds, 
@@ -27,7 +29,24 @@ const client = new Client({
 let events = {};
 const pendingSelections = new Map();
 
-// API : Création d'un événement depuis le site web
+// Fonction pour générer l'embed mis à jour avec la liste des inscrits
+function createEventEmbed(evt) {
+    const tanks = evt.participants.filter(p => p.role === 'Tank').map(p => `• ${p.username} (${p.wowClass})`).join('\n') || 'Aucun';
+    const heals = evt.participants.filter(p => p.role === 'Heal').map(p => `• ${p.username} (${p.wowClass})`).join('\n') || 'Aucun';
+    const dps = evt.participants.filter(p => p.role === 'DPS').map(p => `• ${p.username} (${p.wowClass})`).join('\n') || 'Aucun';
+
+    return new EmbedBuilder()
+        .setTitle(`📢 NOUVEL ÉVÉNEMENT : ${evt.title}`)
+        .setDescription(`**Type :** ${evt.type}\n**Date :** ${evt.date}\n**Détails :** ${evt.details}`)
+        .setColor(evt.type.includes('PvE') ? 0x990000 : 0xc69214)
+        .addFields(
+            { name: `🛡️ Tanks (${evt.participants.filter(p => p.role === 'Tank').length})`, value: tanks, inline: true },
+            { name: `🧪 Heals (${evt.participants.filter(p => p.role === 'Heal').length})`, value: heals, inline: true },
+            { name: `⚔️ DPS (${evt.participants.filter(p => p.role === 'DPS').length})`, value: dps, inline: true }
+        );
+}
+
+// API : Création d'un événement depuis le site web (Onglet Officier)
 app.post('/api/create-event', async (req, res) => {
     const { title, type, date, details, channelId } = req.body;
     const eventId = Date.now().toString();
@@ -36,11 +55,7 @@ app.post('/api/create-event', async (req, res) => {
 
     try {
         const channel = await client.channels.fetch(channelId);
-        
-        const embed = new EmbedBuilder()
-            .setTitle(`📢 NOUVEL ÉVÉNEMENT : ${title}`)
-            .setDescription(`**Type :** ${type}\n**Date :** ${date}\n**Détails :** ${details}`)
-            .setColor(type.includes('PvE') ? 0x990000 : 0xc69214);
+        const embed = createEventEmbed(events[eventId]);
 
         const buttons = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`join_${eventId}_Tank`).setLabel('🛡️ Tank').setStyle(ButtonStyle.Primary),
@@ -62,10 +77,10 @@ app.get('/api/events', (req, res) => {
     res.json(Object.values(events));
 });
 
-// Gestion des interactions Discord (Boutons et Menu Déroulant)
+// Interactions Discord (Boutons et Menu Déroulant)
 client.on('interactionCreate', async interaction => {
     try {
-        // 1. Gestion des clics sur les boutons (Tank, Heal, DPS, Leave)
+        // 1. Clic sur un bouton (Tank, Heal, DPS, Leave)
         if (interaction.isButton()) {
             const [action, eventId, role] = interaction.customId.split('_');
             const evt = events[eventId];
@@ -76,16 +91,20 @@ client.on('interactionCreate', async interaction => {
 
             const username = interaction.member ? interaction.member.displayName : interaction.user.username;
 
+            // Désinscription
             if (action === 'leave') {
                 evt.participants = evt.participants.filter(p => p.username !== username);
+                
+                // Mettre à jour l'embed sur le message principal Discord
+                await interaction.message.edit({ embeds: [createEventEmbed(evt)] });
+
                 return interaction.reply({ content: "❌ Tu t'es désinscrit(e) de l'événement.", ephemeral: true });
             }
 
+            // Inscription (Ouverture du menu de choix de classe)
             if (action === 'join') {
-                // Stocke temporairement le rôle choisi pour l'utilisateur
                 pendingSelections.set(interaction.user.id, { eventId, role });
 
-                // Liste des classes WoW Classic / Forever
                 const selectMenu = new StringSelectMenuBuilder()
                     .setCustomId('select_class')
                     .setPlaceholder('Choisis ta classe WoW...')
@@ -111,7 +130,7 @@ client.on('interactionCreate', async interaction => {
             }
         }
 
-        // 2. Gestion de la sélection de la classe WoW dans le menu déroulant
+        // 2. Sélection de la classe dans le menu déroulant
         if (interaction.isStringSelectMenu() && interaction.customId === 'select_class') {
             const selection = pendingSelections.get(interaction.user.id);
             if (!selection) {
@@ -128,12 +147,15 @@ client.on('interactionCreate', async interaction => {
             const chosenClass = interaction.values[0];
             const username = interaction.member ? interaction.member.displayName : interaction.user.username;
 
-            // Retire l'ancienne inscription si existante
+            // Mettre à jour l'inscription du joueur
             evt.participants = evt.participants.filter(p => p.username !== username);
-
-            // Ajoute le joueur avec son rôle et sa classe
             evt.participants.push({ username, role, wowClass: chosenClass });
             pendingSelections.delete(interaction.user.id);
+
+            // Mettre à jour l'embed principal Discord
+            await interaction.channel.messages.fetch(interaction.message.reference?.messageId || interaction.message.id)
+                .then(msg => msg.edit({ embeds: [createEventEmbed(evt)] }))
+                .catch(() => {});
 
             return interaction.update({
                 content: `✅ Inscrit(e) en tant que **${username}** — Role: **${role}** (${chosenClass}) !`,
@@ -145,11 +167,11 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// Connexion du bot Discord
+// Connexion du bot Discord via le token
 client.login(process.env.DISCORD_TOKEN);
 
 // Démarrage du serveur web
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Serveur prêt et à l'écoute sur le port ${PORT}`);
+    console.log(`Serveur démarré sur le port ${PORT}`);
 });
