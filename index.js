@@ -6,7 +6,8 @@ const {
     ButtonStyle, 
     EmbedBuilder, 
     StringSelectMenuBuilder, 
-    StringSelectMenuOptionBuilder 
+    StringSelectMenuOptionBuilder,
+    PermissionFlagsBits
 } = require('discord.js');
 const express = require('express');
 const cors = require('cors');
@@ -16,7 +17,7 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// Initialisation du client Discord avec les intents requis
+// Initialisation du client Discord
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds, 
@@ -46,12 +47,16 @@ function createEventEmbed(evt) {
         );
 }
 
-// API : Création d'un événement depuis le site web (Onglet Officier)
+// -----------------------------------------------------------------------------
+// ROUTES API (SITE WEB)
+// -----------------------------------------------------------------------------
+
+// API : Création d'un événement
 app.post('/api/create-event', async (req, res) => {
     const { title, type, date, details, channelId } = req.body;
     const eventId = Date.now().toString();
 
-    events[eventId] = { id: eventId, title, type, date, details, participants: [] };
+    events[eventId] = { id: eventId, title, type, date, details, participants: [], messageId: null, channelId };
 
     try {
         const channel = await client.channels.fetch(channelId);
@@ -61,10 +66,13 @@ app.post('/api/create-event', async (req, res) => {
             new ButtonBuilder().setCustomId(`join_${eventId}_Tank`).setLabel('🛡️ Tank').setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId(`join_${eventId}_Heal`).setLabel('🧪 Heal').setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId(`join_${eventId}_DPS`).setLabel('⚔️ DPS').setStyle(ButtonStyle.Danger),
-            new ButtonBuilder().setCustomId(`leave_${eventId}`).setLabel('❌ Désinscription').setStyle(ButtonStyle.Secondary)
+            new ButtonBuilder().setCustomId(`leave_${eventId}`).setLabel('❌ Désinscription').setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`delete_${eventId}`).setLabel('🗑️ Supprimer').setStyle(ButtonStyle.Danger)
         );
 
-        await channel.send({ embeds: [embed], components: [buttons] });
+        const sentMessage = await channel.send({ embeds: [embed], components: [buttons] });
+        events[eventId].messageId = sentMessage.id;
+
         res.json({ success: true, event: events[eventId] });
     } catch (err) {
         console.error("Erreur Discord :", err);
@@ -72,18 +80,67 @@ app.post('/api/create-event', async (req, res) => {
     }
 });
 
-// API : Récupération des événements pour le site
+// API : Récupération des événements (Filtre automatique des événements passés)
 app.get('/api/events', (req, res) => {
-    res.json(Object.values(events));
+    const now = new Date();
+    const activeEvents = Object.values(events).filter(evt => {
+        const eventDate = new Date(evt.date);
+        return eventDate >= now;
+    });
+
+    res.json(activeEvents);
 });
 
-// Interactions Discord (Boutons et Menu Déroulant)
+// API : Suppression manuelle d'un événement depuis le site web
+app.delete('/api/events/:id', async (req, res) => {
+    const { id } = req.params;
+    const evt = events[id];
+
+    if (!evt) {
+        return res.status(404).json({ error: "Événement introuvable" });
+    }
+
+    try {
+        if (evt.channelId && evt.messageId) {
+            const channel = await client.channels.fetch(evt.channelId);
+            const msg = await channel.messages.fetch(evt.messageId);
+            if (msg) await msg.delete();
+        }
+    } catch (err) {
+        console.error("Erreur lors de la suppression du message Discord :", err);
+    }
+
+    delete events[id];
+    res.json({ success: true, message: "Événement supprimé avec succès." });
+});
+
+// -----------------------------------------------------------------------------
+// BOT DISCORD
+// -----------------------------------------------------------------------------
+
 client.on('interactionCreate', async interaction => {
     try {
-        // 1. Clic sur un bouton (Tank, Heal, DPS, Leave)
+        // 1. Clics sur les boutons
         if (interaction.isButton()) {
             const [action, eventId, role] = interaction.customId.split('_');
             const evt = events[eventId];
+
+            // Suppression réservée aux Officiers / Admins sur Discord
+            if (action === 'delete') {
+                const isOfficer = interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages) 
+                               || interaction.memberPermissions?.has(PermissionFlagsBits.Administrator);
+
+                if (!isOfficer) {
+                    return interaction.reply({ 
+                        content: "⛔ Seuls les officiers peuvent supprimer cet événement.", 
+                        ephemeral: true 
+                    });
+                }
+
+                if (evt) delete events[eventId];
+                await interaction.message.delete();
+                return interaction.reply({ content: "🗑️ L'événement a été supprimé.", ephemeral: true });
+            }
 
             if (!evt) {
                 return interaction.reply({ content: "Événement introuvable ou expiré.", ephemeral: true });
@@ -94,14 +151,11 @@ client.on('interactionCreate', async interaction => {
             // Désinscription
             if (action === 'leave') {
                 evt.participants = evt.participants.filter(p => p.username !== username);
-                
-                // Mettre à jour l'embed sur le message principal Discord
                 await interaction.message.edit({ embeds: [createEventEmbed(evt)] });
-
                 return interaction.reply({ content: "❌ Tu t'es désinscrit(e) de l'événement.", ephemeral: true });
             }
 
-            // Inscription (Ouverture du menu de choix de classe)
+            // Inscription (Choix de la classe)
             if (action === 'join') {
                 pendingSelections.set(interaction.user.id, { eventId, role });
 
@@ -130,7 +184,7 @@ client.on('interactionCreate', async interaction => {
             }
         }
 
-        // 2. Sélection de la classe dans le menu déroulant
+        // 2. Choix dans le menu déroulant
         if (interaction.isStringSelectMenu() && interaction.customId === 'select_class') {
             const selection = pendingSelections.get(interaction.user.id);
             if (!selection) {
@@ -147,15 +201,16 @@ client.on('interactionCreate', async interaction => {
             const chosenClass = interaction.values[0];
             const username = interaction.member ? interaction.member.displayName : interaction.user.username;
 
-            // Mettre à jour l'inscription du joueur
             evt.participants = evt.participants.filter(p => p.username !== username);
             evt.participants.push({ username, role, wowClass: chosenClass });
             pendingSelections.delete(interaction.user.id);
 
-            // Mettre à jour l'embed principal Discord
-            await interaction.channel.messages.fetch(interaction.message.reference?.messageId || interaction.message.id)
-                .then(msg => msg.edit({ embeds: [createEventEmbed(evt)] }))
-                .catch(() => {});
+            // Mise à jour du message Discord original
+            if (evt.channelId && evt.messageId) {
+                const channel = await client.channels.fetch(evt.channelId);
+                const msg = await channel.messages.fetch(evt.messageId);
+                if (msg) await msg.edit({ embeds: [createEventEmbed(evt)] });
+            }
 
             return interaction.update({
                 content: `✅ Inscrit(e) en tant que **${username}** — Role: **${role}** (${chosenClass}) !`,
@@ -167,11 +222,11 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-// Connexion du bot Discord via le token
+// Connexion du bot Discord
 client.login(process.env.DISCORD_TOKEN);
 
 // Démarrage du serveur web
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Serveur démarré sur le port ${PORT}`);
+    console.log(`Serveur prêt et à l'écoute sur le port ${PORT}`);
 });
